@@ -1,0 +1,248 @@
+#include <ESP8266WiFi.h>
+#include "base64.h"
+
+// ================== WiFi ==================
+const char* ssid = "Oppo47";
+const char* password = "11111111";
+
+// ================== Twilio ==================
+const char* account_sid = "AC015816e64ffbee01e02e18919080528f";
+const char* auth_token  = "bfdcf825a04da7e43e94bdfc99486421";
+
+// Twilio phone numbers
+const char* twilio_number = "+16678437380";    // Your Twilio number
+const char* my_numbers[] = {
+  "+919509173118",   // First personal number
+  "+916376029092"    // Second personal number
+};
+const int NUM_NUMBERS = 2;
+
+// ================== Emoji Byte Arrays ==================
+// UTF-8 encoded emojis as byte arrays
+const uint8_t gasEmoji[] = {0xE2, 0x9B, 0xFD}; // ⛽
+const uint8_t fireEmoji[] = {0xF0, 0x9F, 0x94, 0xA5}; // 🔥
+const uint8_t safeEmoji[] = {0xE2, 0x9C, 0x85}; // ✅
+const uint8_t warningEmoji[] = {0xE2, 0x9A, 0xA0}; // ⚠
+
+// Function to convert byte array to String
+String emojiToString(const uint8_t* emojiBytes, size_t length) {
+  String result;
+  for (size_t i = 0; i < length; i++) {
+    result += (char)emojiBytes[i];
+  }
+  return result;
+}
+
+// ================== Pins ==================
+#define GAS_SENSOR   A0   // Analog
+#define FIRE_SENSOR  5    // D1
+#define LED_PIN      0    // D3
+#define BUZZER_PIN   4    // D2
+#define FAN_RELAY    12   // D6
+#define PUMP_RELAY   14   // D5
+
+// ================== Alerts ==================
+bool gasAlertSent = false;
+bool fireAlertSent = false;
+bool safeAlertSent = true;  // Start with safe condition
+bool wasInDanger = false;   // Track if we were previously in danger
+unsigned long dangerStart = 0;
+bool inDanger = false;
+bool firstRun = true;       // Track first run to prevent initial safe message
+
+// ================== URL Encode ==================
+String urlEncode(String str) {
+  String encoded = "";
+  char c;
+  char buf[4];
+  for (int i = 0; i < str.length(); i++) {
+    c = str[i];
+    if (isalnum(c)) encoded += c;
+    else if (c == ' ') encoded += '+';
+    else {
+      sprintf(buf, "%%%02X", c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
+
+// ================== Send WhatsApp ==================
+void sendWhatsApp(String to, String body) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect("api.twilio.com", 443)) {
+    Serial.println("❌ WhatsApp connect failed");
+    return;
+  }
+
+  String auth = String(account_sid) + ":" + String(auth_token);
+  String encodedAuth = base64::encode(auth);
+  encodedAuth.replace("\n", "");
+
+  String to_whatsapp = "whatsapp:" + to;
+  String from_whatsapp = "whatsapp:+14155238886"; // Sandbox number
+  
+  String postData = "To=" + urlEncode(to_whatsapp)
+                  + "&From=" + urlEncode(from_whatsapp)
+                  + "&Body=" + urlEncode(body);
+
+  String url = "/2010-04-01/Accounts/" + String(account_sid) + "/Messages.json";
+
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: api.twilio.com");
+  client.println("Authorization: Basic " + encodedAuth);
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(postData.length());
+  client.println();
+  client.print(postData);
+
+  Serial.println("WhatsApp message sent to " + to + ": " + body);
+  client.stop();
+}
+
+// Send to all
+void sendWhatsAppToAll(String body) {
+  for (int i = 0; i < NUM_NUMBERS; i++) {
+    sendWhatsApp(my_numbers[i], body);
+    delay(500);
+  }
+}
+
+// ================== Make Call ==================
+void makeCall(String to) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect("api.twilio.com", 443)) {
+    Serial.println("❌ Call connection failed");
+    return;
+  }
+
+  String auth = String(account_sid) + ":" + String(auth_token);
+  String encodedAuth = base64::encode(auth);
+  encodedAuth.replace("\n", "");
+
+  String url = "/2010-04-01/Accounts/" + String(account_sid) + "/Calls.json";
+
+  // Call Twilio number → forward to my number
+  String postData = "To=" + urlEncode(to) +
+                    "&From=" + urlEncode(twilio_number) +
+                    "&Url=" + urlEncode("http://demo.twilio.com/docs/voice.xml");
+
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: api.twilio.com");
+  client.println("Authorization: Basic " + encodedAuth);
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(postData.length());
+  client.println();
+  client.print(postData);
+
+  Serial.println(" Calling " + to);
+  client.stop();
+}
+
+// ================== Setup ==================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(GAS_SENSOR, INPUT);
+  pinMode(FIRE_SENSOR, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(PUMP_RELAY, OUTPUT);
+
+  // Safe default
+  digitalWrite(LED_PIN, HIGH);  // LED on in safe condition
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(FAN_RELAY, HIGH);
+  digitalWrite(PUMP_RELAY, HIGH);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected");
+  
+  // Send startup message (only once at beginning)
+  sendWhatsAppToAll(emojiToString(warningEmoji, sizeof(warningEmoji)) + " System Started " + emojiToString(warningEmoji, sizeof(warningEmoji)));
+  firstRun = false;
+}
+
+// ================== Loop ==================
+void loop() {
+  int gasValue = analogRead(GAS_SENSOR);
+  int fireValue = digitalRead(FIRE_SENSOR);
+
+  bool gasHigh = (gasValue > 400);
+  bool fireHigh = (fireValue == HIGH);  // HIGH means fire detected
+
+  // Default safe condition
+  digitalWrite(LED_PIN, HIGH);  // LED on
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(FAN_RELAY, HIGH);
+  digitalWrite(PUMP_RELAY, HIGH);
+
+  if (gasHigh) {
+    // Gas detected
+    digitalWrite(LED_PIN, LOW);      // Turn off LED
+    digitalWrite(FAN_RELAY, LOW);   // Turn on fan relay
+    digitalWrite(BUZZER_PIN, HIGH);  // Turn on buzzer
+
+    if (!gasAlertSent) {
+      sendWhatsAppToAll(emojiToString(gasEmoji, sizeof(gasEmoji)) + " GAS DETECTED " + emojiToString(gasEmoji, sizeof(gasEmoji)));
+      gasAlertSent = true;
+      fireAlertSent = false;
+      safeAlertSent = false;
+      wasInDanger = true;  // Mark that we were in danger
+    }
+    inDanger = true;
+    dangerStart = millis();
+  }
+  else if (fireHigh) {
+    // Fire detected
+    digitalWrite(LED_PIN, LOW);       // Turn off LED
+    digitalWrite(PUMP_RELAY, LOW);   // Turn on pump relay
+    digitalWrite(BUZZER_PIN, HIGH);   // Turn on buzzer
+
+    if (!fireAlertSent) {
+      sendWhatsAppToAll(emojiToString(fireEmoji, sizeof(fireEmoji)) + emojiToString(fireEmoji, sizeof(fireEmoji)) + " FIRE DETECTED " + emojiToString(fireEmoji, sizeof(fireEmoji)) + emojiToString(fireEmoji, sizeof(fireEmoji)));
+      fireAlertSent = true;
+      gasAlertSent = false;
+      safeAlertSent = false;
+      wasInDanger = true;  // Mark that we were in danger
+    }
+    inDanger = true;
+    dangerStart = millis();
+  }
+  else {
+    // Safe condition - only send message if we were previously in danger
+    if (wasInDanger && !safeAlertSent && !firstRun) {
+      sendWhatsAppToAll(emojiToString(safeEmoji, sizeof(safeEmoji)) + " SAFE CONDITION " + emojiToString(safeEmoji, sizeof(safeEmoji)));
+      safeAlertSent = true;
+      wasInDanger = false;  // Reset the danger flag
+    }
+    
+    // Reset all alert flags for next detection
+    gasAlertSent = false;
+    fireAlertSent = false;
+    inDanger = false;
+  }
+
+  // If danger persists for more than 10 seconds → keep calling
+  if (inDanger && (millis() - dangerStart > 10000)) {
+    for (int i = 0; i < NUM_NUMBERS; i++) {
+      makeCall(my_numbers[i]);
+      delay(5000); // wait 5 sec between calls
+    }
+    dangerStart = millis(); // reset timer to keep calling
+  }
+
+  delay(500);
+}
